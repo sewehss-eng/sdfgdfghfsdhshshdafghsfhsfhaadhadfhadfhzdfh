@@ -41,8 +41,8 @@ async def scheduler_tick(bot: Bot, db: Database, engine: SyncEngine) -> None:
 
         now = utcnow()
         for task in await db.get_active_tasks():
-            if not task.source_folder_id or engine.is_running(task.id):
-                continue  # синхронизация ещё идёт (например, по кнопке)
+            if not task.source_folder_id or engine.is_busy(task.id):
+                continue  # синхронизация идёт или уже стоит в очереди
 
             if task.last_run_at:
                 try:

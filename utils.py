@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import html
+import random
 import re
 from datetime import datetime, timezone
 
@@ -19,6 +20,17 @@ MAX_INTERVAL_SEC = 30 * 86400  # максимум — 30 дней
 def esc(value: object) -> str:
     """Экранирует текст для HTML-parse mode Telegram."""
     return html.escape(str(value), quote=False)
+
+
+# Невидимые символы Unicode: в Google Drive имя выглядит как обычное,
+# но каждая комбинация — отдельное имя папки.
+_INVISIBLE_MARKS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def unique_clone_name(name: str, count: int = 3) -> str:
+    """Добавляет к имени случайные невидимые символы, чтобы копия не сливалась с уже существующей папкой."""
+    suffix = "".join(random.choice(_INVISIBLE_MARKS) for _ in range(count))
+    return f"{name}{suffix}"
 
 
 def utcnow() -> datetime:
