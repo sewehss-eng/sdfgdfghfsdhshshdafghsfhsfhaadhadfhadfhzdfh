@@ -177,16 +177,18 @@ class Database:
         notify_on_update: bool,
         category: str = "",
         exclude_patterns: str = "",
+        mirror_deletes: bool = False,
     ) -> int:
         async with aiosqlite.connect(self._path) as conn:
             cur = await conn.execute(
                 """INSERT INTO tasks
                    (user_id, title, source_folder_id, target_folder_id,
-                    interval_sec, is_active, notify_on_update, exclude_patterns, category)
-                   VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                    interval_sec, is_active, notify_on_update, exclude_patterns, category,
+                    mirror_deletes)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
                 (user_id, title, source_folder_id, target_folder_id,
                  interval_sec, int(notify_on_update), exclude_patterns.strip()[:2000],
-                 category.strip()[:64]),
+                 category.strip()[:64], int(mirror_deletes)),
             )
             await conn.commit()
             task_id = int(cur.lastrowid)  # type: ignore[arg-type]

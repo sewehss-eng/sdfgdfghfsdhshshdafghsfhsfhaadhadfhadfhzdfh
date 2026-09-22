@@ -266,6 +266,19 @@ class DriveClient:
         содержимое папок на Shared Drive просто не возвращается API.
         """
         query = f"'{folder_id}' in parents and trashed = false"
+        return await self._list_query(query)
+
+    async def search(self, text: str, parent_id: str | None = None) -> list[dict[str, Any]]:
+        """Ищет файлы и папки по подстроке имени. parent_id ограничивает поиск одной папкой."""
+        escaped = text.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"name contains '{escaped}' and trashed = false"
+        if parent_id and parent_id != "root":
+            query += f" and '{parent_id}' in parents"
+        return await self._list_query(query, page_size=50, max_items=30)
+
+    async def _list_query(
+        self, query: str, page_size: int = 500, max_items: int | None = None
+    ) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
@@ -273,13 +286,15 @@ class DriveClient:
 
             def build(s: Any, token: str | None = token) -> Any:  # noqa: B008
                 return s.files().list(
-                    q=query, fields=LIST_FIELDS, pageSize=500,
+                    q=query, fields=LIST_FIELDS, pageSize=page_size,
                     pageToken=token, orderBy="folder,name",
                     supportsAllDrives=True, includeItemsFromAllDrives=True,
                 )
 
             result = await self._call(build)
             items.extend(result.get("files", []))
+            if max_items is not None and len(items) >= max_items:
+                return items[:max_items]
             page_token = result.get("nextPageToken")
             if not page_token:
                 return items
@@ -385,6 +400,18 @@ class DriveClient:
         await self._call(
             lambda s: s.files().update(
                 fileId=file_id, body={"name": new_name}, fields="id", supportsAllDrives=True
+            )
+        )
+
+    async def move_file(self, file_id: str, new_parent_id: str, old_parent_id: str) -> None:
+        """Перемещает файл или папку, меняя родителя (содержимое не копируется)."""
+        await self._call(
+            lambda s: s.files().update(
+                fileId=file_id,
+                addParents=new_parent_id,
+                removeParents=old_parent_id,
+                fields="id,parents",
+                supportsAllDrives=True,
             )
         )
 

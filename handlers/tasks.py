@@ -24,7 +24,7 @@ from handlers.common import (
 )
 from services.drive import DriveError, FOLDER_MIME, extract_drive_id, extract_folder_id
 from services.sync import TaskAlreadyRunningError, render_report
-from utils import esc, format_interval, parse_interval, send_long, split_exclude_patterns, utcnow_iso
+from utils import esc, format_interval, parse_interval, send_long, split_exclude_patterns, unique_clone_name, utcnow_iso
 
 router = Router(name="tasks")
 log = logging.getLogger(__name__)
@@ -61,9 +61,9 @@ class CloneStates(StatesGroup):
     exclude = State()
 
 
-# Интервал автосинхронизации, который получает связка, созданная через /clone —
-# пользователь может изменить его позже через ⚙️ Настройки.
+# Настройки клонирования.
 CLONE_DEFAULT_INTERVAL_SEC = 30 * 60
+CLONE_BATCH_LIMIT = 15
 
 
 def spawn(coro) -> None:  # type: ignore[no-untyped-def]
@@ -102,7 +102,10 @@ def progress_text(task: Task, checked: int, changes: int, folders: int, errors: 
 
 
 async def run_manual_sync(task_id: int, chat_id: int) -> None:
-    """Фоновая синхронизация с одним редактируемым сообщением прогресса."""
+    """Фоновая синхронизация с одним редактируемым сообщением прогресса.
+
+    Если уже идёт другая синхронизация, эта встаёт в очередь и не стартует параллельно.
+    """
     deps = get_deps()
     task = await deps.db.get_task(task_id)
     if task is None:
@@ -110,6 +113,7 @@ async def run_manual_sync(task_id: int, chat_id: int) -> None:
     status = await deps.bot.send_message(chat_id, progress_text(task, 0, 0, 0, 0))
     last_edit = 0.0
     last_snapshot = (-1, -1, -1, -1)
+    announced_queue = False
 
     async def show_progress(report) -> None:  # type: ignore[no-untyped-def]
         nonlocal last_edit, last_snapshot
@@ -126,7 +130,23 @@ async def run_manual_sync(task_id: int, chat_id: int) -> None:
             log.debug("Не удалось обновить прогресс задачи #%s", task_id, exc_info=True)
 
     try:
-        report = await deps.engine.run(task, progress=show_progress)
+        if deps.engine.is_busy(task_id):
+            await status.edit_text("⏳ Синхронизация этой связки уже выполняется или стоит в очереди.")
+            return
+        waiter = asyncio.create_task(deps.engine.run(task, progress=show_progress))
+        while not waiter.done():
+            position = deps.engine.queue_position(task_id)
+            if position > 0 and not announced_queue:
+                announced_queue = True
+                try:
+                    await status.edit_text(
+                        f"⏳ <b>«{esc(task.title)}»</b> в очереди: перед ней {position - 1}.\n"
+                        "Запустится, когда закончится текущая синхронизация."
+                    )
+                except Exception:
+                    log.debug("Не удалось сообщить о очереди задачи #%s", task_id, exc_info=True)
+            await asyncio.wait({waiter}, timeout=1.0)
+        report = waiter.result()
     except TaskAlreadyRunningError:
         await status.edit_text("⏳ Синхронизация этой связки уже выполняется.")
         return
@@ -159,20 +179,51 @@ async def cmd_clone(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(CloneStates.link)
     await message.answer(
-        "📥 <b>Клонирование по ссылке</b>\n\n"
-        "Пришлите ссылку на файл или папку Google Drive (доступную по ссылке — не обязательно вашу). "
-        "Я скопирую её к себе на диск, открою доступ «по ссылке» и пришлю готовую ссылку на копию.\n\n"
-        "📁 Если это папка — заодно создам связку с автосинхронизацией: изменения в источнике будут "
-        f"сами подтягиваться в копию каждые {format_interval(CLONE_DEFAULT_INTERVAL_SEC)} "
-        "(интервал потом можно изменить в настройках связки).\n\n"
-        "После ссылки спрошу, <b>какие файлы не копировать</b> — можно указать имена или маски "
-        "(например <code>*.mp4</code>)." + CANCEL_HINT
+        "📥 <b>Клонирование Google Drive</b>\n\n"
+        "Для одной папки можно прислать только ссылку — исключения я спрошу отдельно.\n\n"
+        f"Для массового клонирования пришлите до {CLONE_BATCH_LIMIT} строк без символа |:\n"
+        "<code>ссылка интервал исключения удаление</code>\n\n"
+        "• интервал пишите слитно: <code>30мин</code>, <code>2ч</code>, <code>1д</code>\n"
+        "• исключения: маска/имя без пробелов либо несколько масок через запятую; "
+        "<code>-</code> — нет исключений\n"
+        "• удаление: <code>+</code> — удалять из копии исчезнувшее в источнике, "
+        "<code>-</code> — не удалять\n\n"
+        "Пример:\n"
+        "<code>https://drive.google.com/drive/folders/AAA 30мин *.mp4,*.zip +\n"
+        "https://drive.google.com/drive/folders/BBB 2ч - -</code>" + CANCEL_HINT
     )
+
+
+def _parse_clone_line(line: str) -> tuple[str, int, str, bool] | None:
+    """Разбирает строку: ссылка интервал исключения +/-; None, если ссылки нет."""
+    parts = line.strip().split()
+    if not parts:
+        return None
+    file_id = extract_drive_id(parts[0])
+    if not file_id:
+        return None
+    if len(parts) != 4:
+        raise ValueError("нужно 4 поля: ссылка интервал исключения + или -")
+    interval = parse_interval(parts[1])
+    if interval is None:
+        raise ValueError(f"не понял интервал {parts[1]}")
+    exclude = "" if parts[2] == "-" else parts[2]
+    if len(exclude) > 1000:
+        raise ValueError("исключения длиннее 1000 символов")
+    if parts[3] not in {"+", "-"}:
+        raise ValueError("последний параметр должен быть + или -")
+    return file_id, interval, exclude, parts[3] == "+"
 
 
 @router.message(CloneStates.link)
 async def step_clone_link(message: Message, state: FSMContext) -> None:
     deps = get_deps()
+    lines = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
+    # Несколько строк или параметры после ссылки означают массовый формат.
+    if len(lines) > 1 or (lines and len(lines[0].split()) > 1):
+        await state.clear()
+        await _start_clone_batch(message, lines)
+        return
     file_id = extract_drive_id(message.text or "")
     if not file_id:
         await message.answer(
@@ -254,6 +305,130 @@ async def step_clone_exclude(message: Message, state: FSMContext) -> None:
     spawn(run_clone_folder(file_id, name, user_id, message.chat.id, exclude_patterns=patterns))
 
 
+async def _start_clone_batch(message: Message, lines: list[str]) -> None:
+    """Разбирает несколько строк и ставит клонирование в общую очередь синхронизации."""
+    if len(lines) > CLONE_BATCH_LIMIT:
+        await message.answer(f"Слишком много строк: максимум {CLONE_BATCH_LIMIT}.")
+        return
+    jobs: list[tuple[str, int, str, bool]] = []
+    bad: list[str] = []
+    for line in lines:
+        try:
+            parsed = _parse_clone_line(line)
+        except ValueError as exc:
+            bad.append(f"«{esc(line[:80])}» — {esc(exc)}")
+            continue
+        if parsed is None:
+            bad.append(f"«{esc(line[:80])}» — нет ссылки")
+            continue
+        jobs.append(parsed)
+    if bad:
+        await message.answer("Пропустил строки:\n" + "\n".join(bad))
+    if not jobs:
+        await message.answer("Нечего клонировать. Начните заново: /clone")
+        return
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    await message.answer(
+        f"⏳ В очереди {len(jobs)} шт. Копирую по одной, в конце пришлю отчёт."
+    )
+    spawn(run_clone_batch(jobs, user_id, message.chat.id))
+
+
+async def run_clone_batch(
+    jobs: list[tuple[str, int, str, bool]], user_id: int, chat_id: int,
+) -> None:
+    """Клонирует список по очереди и шлёт один сводный отчёт."""
+    deps = get_deps()
+    lines: list[str] = [f"📥 <b>Клонирование: {len(jobs)}</b>"]
+    done = 0
+    for index, (source_id, interval, exclude, mirror_deletes) in enumerate(jobs, start=1):
+        lines.append(await _clone_one(
+            deps, source_id, interval, exclude, mirror_deletes,
+            user_id, chat_id, index, len(jobs),
+        ))
+        done += 1
+        if done == 1 or done == len(jobs) or done % 3 == 0:
+            try:
+                await deps.bot.send_message(chat_id, f"⏳ Готово {done} из {len(jobs)}…")
+            except Exception:
+                log.debug("Не удалось обновить прогресс пакета", exc_info=True)
+    await send_long(deps.bot, chat_id, "\n".join(lines))
+
+
+async def _clone_one(
+    deps, source_id: str, interval: int, exclude: str, mirror_deletes: bool,
+    user_id: int, chat_id: int, index: int, total: int,
+) -> str:
+    """Одна строка итогового отчёта. Ошибки не роняют весь пакет."""
+    source_link = f"https://drive.google.com/open?id={source_id}"
+    exclude_label = esc(exclude) if exclude else "-"
+    mirror_label = "включено (+)" if mirror_deletes else "выключено (-)"
+    try:
+        meta = await deps.drive.get_meta(source_id, fields="id,name,mimeType")
+    except DriveError as exc:
+        return (
+            f"\n{index}. ⚠️ {source_link}\n"
+            f"интервал: {format_interval(interval)} • исключения: {exclude_label} • "
+            f"удаление: {mirror_label}\n{esc(exc)}"
+        )
+    if meta is None:
+        return (
+            f"\n{index}. ⚠️ нет доступа\n"
+            f"источник: {source_link}\n"
+            f"интервал: {format_interval(interval)} • исключения: {exclude_label} • "
+            f"удаление: {mirror_label}"
+        )
+    name = str(meta.get("name", source_id))
+    if meta.get("mimeType") != FOLDER_MIME:
+        try:
+            copied = await deps.drive.copy_file(source_id, name, "root")
+            target_id = str(copied["id"])
+            await deps.drive.share_with_anyone(target_id)
+        except DriveError as exc:
+            return f"\n{index}. ⚠️ «{esc(name)}»: {esc(exc)}\nисточник: {source_link}"
+        link = f"https://drive.google.com/file/d/{target_id}/view"
+        return (
+            f"\n{index}/{total}. ✅ файл «{esc(name)}»\n"
+            f"источник: {source_link}\n"
+            f"копия: {link}\n"
+            f"интервал: — • исключения: {exclude_label} • удаление: не применяется"
+        )
+    try:
+        target_id = await deps.drive.ensure_folder(unique_clone_name(name), "root")
+        await deps.drive.share_with_anyone(target_id)
+        task_id = await deps.db.create_task(
+            user_id=user_id, title=name, source_folder_id=source_id,
+            target_folder_id=target_id, interval_sec=interval,
+            notify_on_update=True, exclude_patterns=exclude,
+            mirror_deletes=mirror_deletes,
+        )
+        task = await deps.db.get_task(task_id)
+        assert task is not None
+        report = await deps.engine.run(task)
+        if report.listing_ok and not report.truncated:
+            await deps.db.set_task_last_run(task.id, utcnow_iso())
+    except DriveError as exc:
+        return (
+            f"\n{index}. ⚠️ «{esc(name)}»: {esc(exc)}\n"
+            f"источник: {source_link}\n"
+            f"интервал: {format_interval(interval)} • исключения: {exclude_label} • "
+            f"удаление: {mirror_label}"
+        )
+    except TaskAlreadyRunningError:
+        return f"\n{index}. ⚠️ «{esc(name)}» уже синхронизируется.\nисточник: {source_link}"
+    link = folder_url(target_id)
+    errors = f"\nошибок: {len(report.errors)}" if report.errors else ""
+    return (
+        f"\n{index}/{total}. ✅ «{esc(name)}»\n"
+        f"источник: {source_link}\n"
+        f"копия: {link}\n"
+        f"интервал: {format_interval(interval)} • исключения: {exclude_label} • "
+        f"удаление: {mirror_label}\n"
+        f"файлов: {report.checked}, новых папок: {report.created_folders}, "
+        f"изменений: {len(report.changes)}{errors}"
+    )
+
+
 async def run_clone_file(source_id: str, name: str, mime: str, chat_id: int) -> None:
     """Копирует одиночный файл в корень нашего Диска и делится ссылкой."""
     deps = get_deps()
@@ -288,8 +463,10 @@ async def run_clone_folder(
     """
     deps = get_deps()
     try:
-        # ensure_folder идемпотентен: повторный /clone той же папки не создаст дубликат.
-        target_id = await deps.drive.ensure_folder(name, "root")
+        # Корневая папка всегда новая: невидимый суффикс не даёт ensure_folder
+        # найти предыдущую копию с тем же видимым именем. Вложенные папки
+        # синхронизация по-прежнему сопоставляет по журналу, без суффиксов.
+        target_id = await deps.drive.ensure_folder(unique_clone_name(name), "root")
         await deps.drive.share_with_anyone(target_id)
 
         task_id = await deps.db.create_task(
@@ -302,6 +479,7 @@ async def run_clone_folder(
 
         status = await deps.bot.send_message(chat_id, progress_text(task, 0, 0, 0, 0))
         last_edit = 0.0
+        announced_queue = False
 
         async def show_progress(report) -> None:  # type: ignore[no-untyped-def]
             nonlocal last_edit
@@ -316,7 +494,20 @@ async def run_clone_folder(
             except Exception:
                 log.debug("Не удалось обновить прогресс клонирования", exc_info=True)
 
-        report = await deps.engine.run(task, progress=show_progress)
+        waiter = asyncio.create_task(deps.engine.run(task, progress=show_progress))
+        while not waiter.done():
+            position = deps.engine.queue_position(task.id)
+            if position > 0 and not announced_queue:
+                announced_queue = True
+                try:
+                    await status.edit_text(
+                        f"⏳ <b>«{esc(task.title)}»</b> в очереди: перед ней {position - 1}.\n"
+                        "Копирование начнётся, когда закончится текущая синхронизация."
+                    )
+                except Exception:
+                    log.debug("Не удалось сообщить об очереди клонирования", exc_info=True)
+            await asyncio.wait({waiter}, timeout=1.0)
+        report = waiter.result()
         if report.listing_ok and not report.truncated:
             await deps.db.set_task_last_run(task.id, utcnow_iso())
         else:

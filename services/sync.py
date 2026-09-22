@@ -77,9 +77,31 @@ class SyncEngine:
         self._drive = drive
         self._running: set[int] = set()
         self._stop_requested: set[int] = set()
+        # Один проход Drive за раз: параллельные синхронизации делят один токен
+        # и легко ловят 429/таймауты. Остальные ждут в очереди.
+        self._queue: asyncio.Queue[int] = asyncio.Queue()
+        self._queued: set[int] = set()
+        self._gate = asyncio.Lock()
 
     def is_running(self, task_id: int) -> bool:
         return task_id in self._running
+
+    def is_busy(self, task_id: int) -> bool:
+        """Задача уже выполняется или стоит в очереди."""
+        return task_id in self._running or task_id in self._queued
+
+    def queue_position(self, task_id: int) -> int:
+        """0 — выполняется сейчас, >0 — место в очереди, -1 — не в очереди."""
+        if task_id in self._running:
+            return 0
+        if task_id not in self._queued:
+            return -1
+        ahead = 1
+        for queued_id in list(self._queue._queue):  # noqa: SLF001 — позиция для сообщения пользователю
+            if queued_id == task_id:
+                return ahead
+            ahead += 1
+        return ahead
 
     def request_stop(self, task_id: int) -> bool:
         """Просит безопасно остановить текущий обход после активных API-вызовов."""
@@ -98,53 +120,76 @@ class SyncEngine:
             task_title=task.title,
             started_at=datetime.now(timezone.utc),
         )
-        if task.id in self._running:
+        if task.id in self._running or task.id in self._queued:
             raise TaskAlreadyRunningError(f"Задача {task.id} уже синхронизируется")
 
-        self._running.add(task.id)
-        self._stop_requested.discard(task.id)
-        seen: set[str] = set()
-        item_cache: dict[str, SyncedItem] = {}
-        pending_upserts: dict[str, SyncedItem] = {}
+        self._queued.add(task.id)
+        await self._queue.put(task.id)
+        acquired = False
         try:
-            # Один SELECT вместо запроса SQLite для каждого файла/папки.
-            item_cache = {item.source_id: item for item in await self._db.get_synced_items(task.id)}
-            if not task.source_folder_id:
-                report.errors.append("Источник ещё не подключён. Добавьте его в настройках задачи.")
-                return report
-            await self._walk(
-                task, task.source_folder_id, task.target_folder_id,
-                path="", report=report, seen=seen, depth=0,
-                item_cache=item_cache, pending_upserts=pending_upserts, progress=progress,
-            )
-            # «Пропавшие» из источника считаем только если обход прошёл без ошибок,
-            # иначе есть риск ложных срабатываний из-за частичного листинга.
-            if report.listing_ok and not report.truncated:
-                # Ранее синхронизированные, но теперь исключённые маской элементы
-                # игнорируем молча: они не «исчезли из источника» и удалять их не нужно.
-                stale_items = [
-                    i for i in item_cache.values()
-                    if i.source_id not in seen
-                    and not is_excluded(i.file_name, task.exclude_patterns)
-                ]
-                if task.mirror_deletes:
-                    await self._mirror_deletions(task, stale_items, report)
-                else:
-                    report.stale = [i.file_name for i in stale_items]
-        except Exception as exc:  # noqa: BLE001 — фоновая задача не должна ронять воркера
-            log.exception("Критическая ошибка синхронизации задачи #%s", task.id)
-            report.errors.append(f"Критическая ошибка: {exc!r}")
-        finally:
-            # Все новые/изменённые записи — одним executemany + одной транзакцией.
-            if pending_upserts:
+            # Ждём своей очереди. Замок держим до конца прохода, чтобы следующий
+            # не стартовал, пока этот не освободит Drive.
+            while True:
+                await self._gate.acquire()
                 try:
-                    await self._db.upsert_synced_items(list(pending_upserts.values()))
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("Не сохранён пакет журнала задачи #%s", task.id)
-                    report.errors.append(f"Не сохранён журнал синхронизации: {exc!r}")
-            self._running.discard(task.id)
+                    if self._queue.qsize() and self._queue._queue[0] == task.id:  # noqa: SLF001
+                        await self._queue.get()
+                        acquired = True
+                        break
+                finally:
+                    if not acquired:
+                        self._gate.release()
+                await asyncio.sleep(0.2)
+            self._queued.discard(task.id)
+
+            self._running.add(task.id)
             self._stop_requested.discard(task.id)
-            report.finished_at = datetime.now(timezone.utc)
+            seen: set[str] = set()
+            item_cache: dict[str, SyncedItem] = {}
+            pending_upserts: dict[str, SyncedItem] = {}
+            try:
+                # Один SELECT вместо запроса SQLite для каждого файла/папки.
+                item_cache = {item.source_id: item for item in await self._db.get_synced_items(task.id)}
+                if not task.source_folder_id:
+                    report.errors.append("Источник ещё не подключён. Добавьте его в настройках задачи.")
+                    return report
+                await self._walk(
+                    task, task.source_folder_id, task.target_folder_id,
+                    path="", report=report, seen=seen, depth=0,
+                    item_cache=item_cache, pending_upserts=pending_upserts, progress=progress,
+                )
+                # «Пропавшие» из источника считаем только если обход прошёл без ошибок,
+                # иначе есть риск ложных срабатываний из-за частичного листинга.
+                if report.listing_ok and not report.truncated:
+                    # Ранее синхронизированные, но теперь исключённые маской элементы
+                    # игнорируем молча: они не «исчезли из источника» и удалять их не нужно.
+                    stale_items = [
+                        i for i in item_cache.values()
+                        if i.source_id not in seen
+                        and not is_excluded(i.file_name, task.exclude_patterns)
+                    ]
+                    if task.mirror_deletes:
+                        await self._mirror_deletions(task, stale_items, report)
+                    else:
+                        report.stale = [i.file_name for i in stale_items]
+            except Exception as exc:  # noqa: BLE001 — фоновая задача не должна ронять воркера
+                log.exception("Критическая ошибка синхронизации задачи #%s", task.id)
+                report.errors.append(f"Критическая ошибка: {exc!r}")
+            finally:
+                # Все новые/изменённые записи — одним executemany + одной транзакцией.
+                if pending_upserts:
+                    try:
+                        await self._db.upsert_synced_items(list(pending_upserts.values()))
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Не сохранён пакет журнала задачи #%s", task.id)
+                        report.errors.append(f"Не сохранён журнал синхронизации: {exc!r}")
+                self._running.discard(task.id)
+                self._stop_requested.discard(task.id)
+                report.finished_at = datetime.now(timezone.utc)
+        finally:
+            self._queued.discard(task.id)
+            if acquired:
+                self._gate.release()
         if progress is not None:
             try:
                 await progress(report)
