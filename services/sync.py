@@ -8,9 +8,7 @@ Google Workspace экспортируются в Office/PDF-форматы.
 
 from __future__ import annotations
 
-import asyncio
-import logging
-from collections.abc import Awaitable, Callable
+undefined
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -24,8 +22,7 @@ log = logging.getLogger(__name__)
 
 MAX_TREE_ITEMS = 5000  # защитный лимит объёма одного прохода
 MAX_DEPTH = 15          # защитный лимит вложенности
-MAX_LISTED = 25         # сколько позиций показывать в отчёте
-ProgressCallback = Callable[["SyncReport"], Awaitable[None]]
+undefined = Callable[["SyncReport"], Awaitable[None]]
 
 KIND_NEW = "new"
 KIND_UPDATED = "updated"
@@ -39,11 +36,7 @@ NOT_SYNCABLE_MIMES = {
 }
 
 
-class TaskAlreadyRunningError(Exception):
-    """Синхронизация этой задачи уже выполняется."""
-
-
-@dataclass(frozen=True)
+undefined(frozen=True)
 class Change:
     kind: str   # new / updated / renamed
     name: str
@@ -489,26 +482,41 @@ class SyncEngine:
             return
 
         used_fallback = False
+        docx_note = ""
         kind = KIND_NEW if record is None else KIND_UPDATED
         try:
-            try:
-                # Основной путь: серверное копирование без скачивания
-                copied = await self._drive.copy_file(source_id, name, parent_target_id)
-                target_id = str(copied["id"])
-                if record is not None:
-                    # старую версию удаляем, чтобы не плодить дубликаты
-                    await self._drive.delete_file_quietly(record.target_id)
-            except DriveError as copy_exc:
-                # Fallback: не хватает прав на files.copy -> качаем и заливаем сами
-                log.info("files.copy не сработал (%s) — download+upload: %s", copy_exc, name)
+            if mime == DOCX_MIME or name.lower().endswith(".docx"):
+                # DOCX сначала обрабатываем локально: files.copy не позволяет
+                # удалить только нужную картинку внутри архива.
                 content = await self._drive.download_bytes(source_id)
+                content, removed = _prepare_docx_first_image(content)
                 used_fallback = True
+                docx_note = "удалена первая картинка до текста" if removed else "картинка до текста не найдена"
                 if record is not None:
                     updated = await self._drive.update_file(record.target_id, name, mime, content)
                     target_id = str(updated["id"])
                 else:
                     uploaded = await self._drive.upload_bytes(name, mime, parent_target_id, content)
                     target_id = str(uploaded["id"])
+            else:
+                try:
+                    # Основной путь: серверное копирование без скачивания
+                    copied = await self._drive.copy_file(source_id, name, parent_target_id)
+                    target_id = str(copied["id"])
+                    if record is not None:
+                        # старую версию удаляем, чтобы не плодить дубликаты
+                        await self._drive.delete_file_quietly(record.target_id)
+                except DriveError as copy_exc:
+                    # Fallback: не хватает прав на files.copy -> качаем и заливаем сами
+                    log.info("files.copy не сработал (%s) — download+upload: %s", copy_exc, name)
+                    content = await self._drive.download_bytes(source_id)
+                    used_fallback = True
+                    if record is not None:
+                        updated = await self._drive.update_file(record.target_id, name, mime, content)
+                        target_id = str(updated["id"])
+                    else:
+                        uploaded = await self._drive.upload_bytes(name, mime, parent_target_id, content)
+                        target_id = str(uploaded["id"])
         except DriveError as exc:
             report.listing_ok = False
             report.errors.append(f"«{path}»: {exc}")
@@ -519,9 +527,8 @@ class SyncEngine:
         )
         item_cache[source_id] = saved_record
         pending_upserts[source_id] = saved_record
-        report.changes.append(
-            Change(kind, name, path, "скачан и загружен вручную" if used_fallback else "")
-        )
+        note = docx_note if (mime == DOCX_MIME or name.lower().endswith(".docx")) else ("скачан и загружен вручную" if used_fallback else "")
+        report.changes.append(Change(kind, name, path, note))
 
     # ------------------------------------------------- Google Workspace
 
@@ -564,6 +571,10 @@ class SyncEngine:
         kind = KIND_NEW if record is None else KIND_UPDATED
         try:
             content = await self._drive.export_bytes(source_id, export_mime)
+            docx_note = ""
+            if export_mime == DOCX_MIME:
+                content, removed = _prepare_docx_first_image(content)
+                docx_note = "удалена первая картинка до текста" if removed else "картинка до текста не найдена"
             if record is not None:
                 updated = await self._drive.update_file(
                     record.target_id, target_name, export_mime, content
@@ -584,7 +595,10 @@ class SyncEngine:
         )
         item_cache[source_id] = saved_record
         pending_upserts[source_id] = saved_record
-        report.changes.append(Change(kind, target_name, path, "экспорт из Google Workspace"))
+        note = "экспорт из Google Workspace"
+        if docx_note:
+            note += "; " + docx_note
+        report.changes.append(Change(kind, target_name, path, note))
 
 
 def render_report(report: SyncReport) -> str:
