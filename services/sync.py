@@ -47,6 +47,55 @@ NOT_SYNCABLE_MIMES = {
 }
 
 
+def _prepare_docx_first_image(content: bytes) -> tuple[bytes, bool]:
+    """Удаляет первую картинку, стоящую до первого текста, из DOCX.
+
+    DOCX — это ZIP-архив. Мы меняем только word/document.xml, поэтому
+    форматирование, остальные картинки, таблицы и вложения сохраняются.
+    Если архив повреждён или нужный XML не найден, исходные байты возвращаются
+    без изменений.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as source:
+            document_name = "word/document.xml"
+            if document_name not in source.namelist():
+                return content, False
+
+            root = ET.fromstring(source.read(document_name))
+            parent_by_child = {
+                child: parent
+                for parent in root.iter()
+                for child in parent
+            }
+            first_image = None
+            text_seen = False
+            for element in root.iter():
+                if element.tag == TEXT_TAG and (element.text or ""):
+                    text_seen = True
+                elif not text_seen and element.tag in (DRAWING_TAG, PICT_TAG):
+                    first_image = element
+                    break
+
+            if first_image is None:
+                return content, False
+
+            parent = parent_by_child.get(first_image)
+            if parent is None:
+                return content, False
+            parent.remove(first_image)
+            updated_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as target:
+                for info in source.infolist():
+                    data = updated_xml if info.filename == document_name else source.read(info.filename)
+                    target.writestr(info, data)
+            return output.getvalue(), True
+    except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile):
+        log.exception("Не удалось обработать DOCX; исходный файл сохранён без изменений")
+        return content, False
+
+
 @dataclass(frozen=True)
 class Change:
     kind: str   # new / updated / renamed

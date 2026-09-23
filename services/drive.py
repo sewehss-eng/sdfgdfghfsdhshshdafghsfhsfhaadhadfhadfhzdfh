@@ -352,16 +352,19 @@ class DriveClient:
     async def download_bytes(self, file_id: str) -> bytes:
         """Скачивает файл в память (fallback-путь).
 
-        `get_media` — настоящий download (`alt=media`). `acknowledgeAbuse`
-        дописывается в query уже готового request: если передать его в
-        обычный `files().get()`, клиент не помечает запрос как скачивание,
-        и Drive отвечает 403 «parameter is only applicable for download requests».
+        `get_media` — настоящий download (`alt=media`), поэтому
+        `acknowledgeAbuse` передаётся его официальным параметром. В обычный
+        `files().get()` этот параметр передавать нельзя.
         """
 
         def build(s: Any) -> Any:
-            request = s.files().get_media(fileId=file_id, supportsAllDrives=True)
-            request.uri += "&acknowledgeAbuse=true"
-            return request
+            # acknowledgeAbuse допустим только для download-запроса.
+            # get_media формирует именно такой запрос (alt=media).
+            return s.files().get_media(
+                fileId=file_id,
+                acknowledgeAbuse=True,
+                supportsAllDrives=True,
+            )
 
         return await self._download(build)
 
