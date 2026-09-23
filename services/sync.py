@@ -47,7 +47,7 @@ NOT_SYNCABLE_MIMES = {
 }
 
 
-undefined(frozen=True)
+@dataclass(frozen=True)
 class Change:
     kind: str   # new / updated / renamed
     name: str
@@ -71,6 +71,10 @@ class SyncReport:
     deleted: list[str] = field(default_factory=list)  # удалены в назначении (mirror_deletes включён)
     listing_ok: bool = True   # False -> отчёт о «stale» не показываем
     truncated: bool = False
+
+
+class TaskAlreadyRunningError(Exception):
+    """Синхронизация этой задачи уже выполняется или ожидает своей очереди."""
 
 
 class SyncEngine:
