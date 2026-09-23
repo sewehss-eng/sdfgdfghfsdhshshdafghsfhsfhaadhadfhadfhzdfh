@@ -352,14 +352,18 @@ class DriveClient:
     async def download_bytes(self, file_id: str) -> bytes:
         """Скачивает файл в память (fallback-путь).
 
-        `alt="media"` обязателен: без него Drive API вернёт JSON-метаданные
-        вместо байтов содержимого, и MediaIoBaseDownload не сможет скачать файл.
+        `get_media` — настоящий download (`alt=media`). `acknowledgeAbuse`
+        дописывается в query уже готового request: если передать его в
+        обычный `files().get()`, клиент не помечает запрос как скачивание,
+        и Drive отвечает 403 «parameter is only applicable for download requests».
         """
-        return await self._download(
-            lambda s: s.files().get(
-                fileId=file_id, alt="media", supportsAllDrives=True, acknowledgeAbuse=True
-            )
-        )
+
+        def build(s: Any) -> Any:
+            request = s.files().get_media(fileId=file_id, supportsAllDrives=True)
+            request.uri += "&acknowledgeAbuse=true"
+            return request
+
+        return await self._download(build)
 
     async def export_bytes(self, file_id: str, target_mime: str) -> bytes:
         """Экспорт нативного Google-документа в выбранный формат."""
