@@ -8,7 +8,12 @@ Google Workspace экспортируются в Office/PDF-форматы.
 
 from __future__ import annotations
 
-undefined
+import asyncio
+import io
+import logging
+import zipfile
+import xml.etree.ElementTree as ET
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -22,7 +27,13 @@ log = logging.getLogger(__name__)
 
 MAX_TREE_ITEMS = 5000  # защитный лимит объёма одного прохода
 MAX_DEPTH = 15          # защитный лимит вложенности
-undefined = Callable[["SyncReport"], Awaitable[None]]
+MAX_LISTED = 25         # сколько позиций показывать в отчёте
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+DRAWING_TAG = f"{{{W_NS}}}drawing"
+PICT_TAG = f"{{{W_NS}}}pict"
+TEXT_TAG = f"{{{W_NS}}}t"
+ProgressCallback = Callable[["SyncReport"], Awaitable[None]]
 
 KIND_NEW = "new"
 KIND_UPDATED = "updated"
