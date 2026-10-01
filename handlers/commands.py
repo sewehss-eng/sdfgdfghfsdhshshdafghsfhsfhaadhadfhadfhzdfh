@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 
 from aiogram import Router
 from aiogram.filters import Command, CommandStart
@@ -28,10 +30,11 @@ START_TEXT = (
     "удаление <code>+</code> — зеркалировать удаления, <code>-</code> — не удалять; "
     "категория необязательна и может содержать пробелы\n"
     "• /new_task — создать связку «источник → назначение» вручную (мастер из 5 шагов)\n"
-    "• /new_folder Название — создать папку сразу, а источник подключить позже\n"
+    "• /new_folder — создать одну или несколько папок по источникам; старый формат /new_folder Название тоже поддерживается\n"
     "• /tasks — удобный список задач по категориям\n"
     "• /folders — проводник: просмотр, загрузка файлов, создание папок, поиск, перемещение, переименование и удаление\n"
-    "• /cancel — отменить текущее действие. ⏸ Пауза: остановить автосинхронизацию по интервалу и возобновить в любой момент — настройки, журнал и файлы сохраняются; ручной запуск работает и на паузе\n\n"
+    "• /cancel — отменить текущее действие. ⏸ Пауза: остановить автосинхронизацию по интервалу и возобновить в любой момент — настройки, журнал и файлы сохраняются; ручной запуск работает и на паузе\n"
+    "• /restart — полностью перезапустить бота\n\n"
     "💡 Ссылку на чужую публичную папку можно вставить целиком — я сам извлеку Folder ID."
 )
 
@@ -50,3 +53,11 @@ async def cmd_help(message: Message) -> None:
 async def cmd_tasks(message: Message) -> None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     await send_tasks_menu(message, user_id)
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message) -> None:
+    """Перезапускает текущий Python-процесс; внешний менеджер поднимет его снова."""
+    await message.answer("🔄 Перезапускаю бота…")
+    await message.bot.session.close()
+    os.execl(sys.executable, sys.executable, *sys.argv)

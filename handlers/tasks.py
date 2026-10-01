@@ -61,9 +61,14 @@ class CloneStates(StatesGroup):
     exclude = State()
 
 
+class NewFolderStates(StatesGroup):
+    """Шаги массового создания папок с автосинхронизацией."""
+    link = State()
+
 # Настройки клонирования.
 CLONE_DEFAULT_INTERVAL_SEC = 30 * 60
 CLONE_BATCH_LIMIT = 15
+NEW_FOLDER_BATCH_LIMIT = CLONE_BATCH_LIMIT
 
 
 def spawn(coro) -> None:  # type: ignore[no-untyped-def]
@@ -310,8 +315,10 @@ async def step_clone_exclude(message: Message, state: FSMContext) -> None:
     spawn(run_clone_folder(file_id, name, user_id, message.chat.id, exclude_patterns=patterns))
 
 
-async def _start_clone_batch(message: Message, lines: list[str]) -> None:
-    """Разбирает несколько строк и ставит клонирование в общую очередь синхронизации."""
+async def _start_clone_batch(
+    message: Message, lines: list[str], operation: str = "clone",
+) -> None:
+    """Разбирает строки и ставит создание копий в общую очередь синхронизации."""
     if len(lines) > CLONE_BATCH_LIMIT:
         await message.answer(f"Слишком много строк: максимум {CLONE_BATCH_LIMIT}.")
         return
@@ -330,21 +337,26 @@ async def _start_clone_batch(message: Message, lines: list[str]) -> None:
     if bad:
         await message.answer("Пропустил строки:\n" + "\n".join(bad))
     if not jobs:
-        await message.answer("Нечего клонировать. Начните заново: /clone")
+        await message.answer(
+            "Нечего обрабатывать. Начните заново: "
+            f"/{'new_folder' if operation == 'new_folder' else 'clone'}"
+        )
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     await message.answer(
-        f"⏳ В очереди {len(jobs)} шт. Копирую по одной, в конце пришлю отчёт."
+        f"⏳ В очереди {len(jobs)} шт. Создаю папки по одной, в конце пришлю отчёт."
     )
-    spawn(run_clone_batch(jobs, user_id, message.chat.id))
+    spawn(run_clone_batch(jobs, user_id, message.chat.id, operation=operation))
 
 
 async def run_clone_batch(
     jobs: list[tuple[str, int, str, bool, str]], user_id: int, chat_id: int,
+    operation: str = "clone",
 ) -> None:
-    """Клонирует список по очереди и шлёт один сводный отчёт."""
+    """Обрабатывает список по очереди и шлёт один сводный отчёт."""
     deps = get_deps()
-    lines: list[str] = [f"📥 <b>Клонирование: {len(jobs)}</b>"]
+    heading = "Создание папок" if operation == "new_folder" else "Клонирование"
+    lines: list[str] = [f"📥 <b>{heading}: {len(jobs)}</b>"]
     done = 0
     for index, (source_id, interval, exclude, mirror_deletes, category) in enumerate(jobs, start=1):
         lines.append(await _clone_one(
@@ -540,14 +552,23 @@ async def run_clone_folder(
         await send_long(deps.bot, chat_id, f"⚠️ Не удалось клонировать папку: {esc(exc)}")
 
 
-@router.message(Command("new_folder"))
-async def cmd_new_folder(message: Message) -> None:
-    """Создаёт папку назначения и задачу без источника — источник можно привязать позже."""
+def _command_payload(message: Message) -> str:
+    """Возвращает аргументы команды, сохраняя переводы строк."""
+    text = message.text or ""
+    _, separator, payload = text.partition(" ")
+    if not separator:
+        _, separator, payload = text.partition("\n")
+    return payload.strip() if separator else ""
+
+
+def _looks_like_drive_source(payload: str) -> bool:
+    first = payload.split(maxsplit=1)[0] if payload.split() else ""
+    return bool(extract_drive_id(first))
+
+
+async def _create_empty_folder(message: Message, name: str) -> None:
+    """Старый режим /new_folder: папка без источника."""
     deps = get_deps()
-    name = " ".join((message.text or "").split(maxsplit=1)[1:]).strip()
-    if not name or len(name) > 64:
-        await message.answer("Использование: <code>/new_folder Название папки</code>")
-        return
     try:
         target_id = await deps.drive.ensure_folder(name, "root")
         task_id = await deps.db.create_task(
@@ -563,6 +584,43 @@ async def cmd_new_folder(message: Message) -> None:
         "✅ Папка создана. Источник пока не подключён — добавьте его кнопкой «Настройки».\n\n"
         + task_card_text(task, 0), reply_markup=task_keyboard(task)
     )
+
+
+@router.message(Command("new_folder"))
+async def cmd_new_folder(message: Message, state: FSMContext) -> None:
+    """Одна пустая папка или пакет папок по формату /clone."""
+    payload = _command_payload(message)
+    if not payload:
+        await state.clear()
+        await state.set_state(NewFolderStates.link)
+        await message.answer(
+            "📁 <b>Массовое создание папок</b>\n\n"
+            f"Пришлите до {NEW_FOLDER_BATCH_LIMIT} строк:\n"
+            "<code>ссылка интервал исключения удаление категория</code>\n\n"
+            "Пример:\n<code>ссылка1 30мин *.mp4 + Учёба\nссылка2 2ч - - Архив</code>"
+            + CANCEL_HINT
+        )
+        return
+    lines = [line.strip() for line in payload.splitlines() if line.strip()]
+    if len(lines) > 1 or _looks_like_drive_source(lines[0]):
+        await state.clear()
+        await _start_clone_batch(message, lines, operation="new_folder")
+        return
+    if len(payload) <= 64:
+        await state.clear()
+        await _create_empty_folder(message, payload)
+        return
+    await message.answer("Используйте формат: <code>ссылка интервал исключения удаление категория</code>")
+
+
+@router.message(NewFolderStates.link)
+async def step_new_folder_batch(message: Message, state: FSMContext) -> None:
+    lines = [line.strip() for line in (message.text or "").splitlines() if line.strip()]
+    if not lines:
+        await message.answer("Пришлите хотя бы одну строку или используйте /cancel.")
+        return
+    await state.clear()
+    await _start_clone_batch(message, lines, operation="new_folder")
 
 
 @router.message(Command("new_task"))
