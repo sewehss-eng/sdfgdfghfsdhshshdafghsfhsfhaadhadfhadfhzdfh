@@ -117,6 +117,34 @@ async def send_long(bot: Bot, chat_id: int, text: str) -> None:
 
 # ------------------------------------------------------------------ исключения
 
+# Глобальные маски файлов, которые НИКОГДА не копируются на диск.
+# Сюда попадает системный мусор, временные файлы и т.д.
+# Можно дополнить через .env переменную GLOBAL_EXCLUDE_PATTERNS.
+DEFAULT_GLOBAL_EXCLUDES: tuple[str, ...] = (
+    # macOS
+    ".DS_Store",
+    "._*",
+    # Windows
+    "Thumbs.db",
+    "desktop.ini",
+    "*.lnk",
+    # Временные / мусорные файлы
+    "~*",
+    "*.tmp",
+    "*.temp",
+    "*.bak",
+    "*.swp",
+    "*.swo",
+    "*~",
+    # Telegram-бот мусор (если вдруг попадёт как отдельный файл)
+    ".tg_*",
+    # Файлы-реклама / инструкции, которые всегда игнорируем
+    "(ИСТОЧНИК ОТВЕТОВ @NCEI4SLIVOGE.pdf)",
+    "(инструкция.pdf)",
+    "(@FREEANSWXRS БЕСПЛАТНО_В ТГ.pdf)",
+)
+
+
 def split_exclude_patterns(raw: str) -> list[str]:
     """Разбивает строку исключений на маски (разделители: запятая или новая строка)."""
     patterns: list[str] = []
@@ -127,20 +155,39 @@ def split_exclude_patterns(raw: str) -> list[str]:
     return patterns
 
 
-def is_excluded(name: str, patterns_raw: str) -> bool:
-    """True, если имя файла/папки подпадает под список исключений связки.
+def _match_pattern(lowered_name: str, pattern_lower: str) -> bool:
+    """Проверяет одно имя против одной маски."""
+    if "*" in pattern_lower or "?" in pattern_lower:
+        return fnmatch.fnmatchcase(lowered_name, pattern_lower)
+    return lowered_name == pattern_lower
 
-    Маски задаются через запятую: точное имя («отчёт.docx») или шаблон
-    с подстановочными знаками * и ? («*.mp4», «черновик*»). Регистр не важен.
+
+def is_excluded(name: str, patterns_raw: str, global_patterns: tuple[str, ...] = ()) -> bool:
+    """True, если имя файла/папки подпадает под исключения.
+
+    Проверяет в два этапа:
+      1. Глобальные маски (DEFAULT_GLOBAL_EXCLUDES + из .env) — всегда.
+      2. Пользовательские маски конкретной связки (patterns_raw).
+
+    Маски: точное имя («отчёт.docx») или шаблон с * и ? («*.mp4»).
+    Регистр не важен.
     """
-    if not patterns_raw:
-        return False
     lowered = name.lower()
-    for pattern in split_exclude_patterns(patterns_raw):
-        p = pattern.lower()
-        if "*" in p or "?" in p:
-            if fnmatch.fnmatchcase(lowered, p):
-                return True
-        elif lowered == p:
+
+    # 1. Глобальные дефолтные исключения
+    for p in DEFAULT_GLOBAL_EXCLUDES:
+        if _match_pattern(lowered, p.lower()):
             return True
+
+    # 2. Глобальные исключения из .env
+    for p in global_patterns:
+        if _match_pattern(lowered, p.lower()):
+            return True
+
+    # 3. Пользовательские исключения связки
+    if patterns_raw:
+        for p in split_exclude_patterns(patterns_raw):
+            if _match_pattern(lowered, p.lower()):
+                return True
+
     return False

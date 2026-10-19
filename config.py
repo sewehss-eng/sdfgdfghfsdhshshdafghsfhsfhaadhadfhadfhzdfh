@@ -25,6 +25,12 @@ class Config:
     scheduler_tick_sec: int
     drive_max_retries: int
     log_level: str
+    # Фрагменты, которые вырезаются из имён файлов при копировании/загрузке.
+    # Задаются в .env через запятую: NAME_STRIP_FRAGMENTS=@site.ru,[копия],скачано с
+    name_strip_fragments: tuple[str, ...] = ()
+    # Глобальные маски файлов, которые никогда не заливаются на диск (дополнение к дефолтным).
+    # Задаются в .env через запятую: GLOBAL_EXCLUDE_PATTERNS=*.torrent,spam_*
+    global_exclude_patterns: tuple[str, ...] = ()
 
 
 def load_config() -> Config:
@@ -40,7 +46,23 @@ def load_config() -> Config:
         scheduler_tick_sec=max(30, int(os.getenv("SCHEDULER_TICK_SEC", "60"))),
         drive_max_retries=max(1, int(os.getenv("DRIVE_MAX_RETRIES", "5"))),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        name_strip_fragments=_parse_fragments(os.getenv("NAME_STRIP_FRAGMENTS", "")),
+        global_exclude_patterns=_parse_fragments(os.getenv("GLOBAL_EXCLUDE_PATTERNS", "")),
     )
+
+
+def _parse_fragments(raw: str) -> tuple[str, ...]:
+    """Разбирает список фрагментов для удаления из имён.
+
+    Разделители: запятая или перевод строки. Пустые элементы отбрасываются.
+    Порядок сохраняется, повторы удаляются.
+    """
+    seen: dict[str, None] = {}
+    for chunk in raw.replace("\r", "").replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if chunk and chunk not in seen:
+            seen[chunk] = None
+    return tuple(seen)
 
 
 config: Config = load_config()

@@ -102,6 +102,7 @@ async def main() -> None:
         credentials_file=config.credentials_file,
         token_file=config.token_file,
         max_retries=config.drive_max_retries,
+        strip_fragments=config.name_strip_fragments,
     )
     try:
         await drive.ensure_authorized()  # fail-fast: без token.json бот не стартует
@@ -110,7 +111,7 @@ async def main() -> None:
         sys.exit(1)
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    engine = SyncEngine(db, drive)
+    engine = SyncEngine(db, drive, global_exclude_patterns=config.global_exclude_patterns)
     set_deps(Deps(bot=bot, db=db, drive=drive, engine=engine))
 
     # --- роутеры ---------------------------------------------------------

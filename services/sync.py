@@ -223,7 +223,7 @@ class SyncEngine:
                     stale_items = [
                         i for i in item_cache.values()
                         if i.source_id not in seen
-                        and not is_excluded(i.file_name, task.exclude_patterns)
+                        and not is_excluded(i.file_name, task.exclude_patterns, self._global_excludes)
                     ]
                     if task.mirror_deletes:
                         await self._mirror_deletions(task, stale_items, report)
@@ -327,7 +327,7 @@ class SyncEngine:
             name: str = item.get("name", source_id)
             mime: str = item.get("mimeType", "")
             child_path = f"{path}/{name}" if path else name
-            if is_excluded(name, task.exclude_patterns):
+            if is_excluded(name, task.exclude_patterns, self._global_excludes):
                 # Папка исключена маской — не создаём её в назначении и не заходим внутрь.
                 report.excluded_names.append(child_path)
                 continue
@@ -380,7 +380,7 @@ class SyncEngine:
         path = f"{base_path}/{name}" if base_path else name
         if self._should_stop(task.id):
             return
-        if is_excluded(name, task.exclude_patterns):
+        if is_excluded(name, task.exclude_patterns, self._global_excludes):
             report.excluded_names.append(path)
             return
         seen.add(source_id)
@@ -726,5 +726,8 @@ def render_report(report: SyncReport) -> str:
     if not report.changes and not report.errors and not report.stale and not report.deleted \
             and not report.excluded_names:
         lines.append("✅ Изменений нет — всё актуально.")
+
+    return "\n".join(lines)
+pend("✅ Изменений нет — всё актуально.")
 
     return "\n".join(lines)

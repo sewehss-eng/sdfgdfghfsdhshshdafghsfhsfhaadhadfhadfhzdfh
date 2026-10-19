@@ -123,10 +123,17 @@ def extract_drive_id(text: str) -> str | None:
 class DriveClient:
     """Асинхронная обёртка над googleapiclient с backoff и локами."""
 
-    def __init__(self, credentials_file: str, token_file: str, max_retries: int = 5) -> None:
+    def __init__(
+        self,
+        credentials_file: str,
+        token_file: str,
+        max_retries: int = 5,
+        strip_fragments: tuple[str, ...] = (),
+    ) -> None:
         self._credentials_file = credentials_file
         self._token_file = token_file
         self._max_retries = max(1, max_retries)
+        self._strip_fragments = tuple(f for f in strip_fragments if f)
         self._service: Any | None = None
         self._build_lock = asyncio.Lock()
 
@@ -342,6 +349,7 @@ class DriveClient:
 
     async def copy_file(self, source_id: str, name: str, parent_id: str) -> dict[str, Any]:
         """Серверное копирование files.copy — трафик через наш сервер не идёт."""
+        name = self._clean_name(name)
         return await self._call(
             lambda s: s.files().copy(
                 fileId=source_id, supportsAllDrives=True,
@@ -378,6 +386,7 @@ class DriveClient:
         self, name: str, mime: str, parent_id: str, content: bytes
     ) -> dict[str, Any]:
         """Загружает файл из памяти (resumable — переживёт большие файлы)."""
+        name = self._clean_name(name)
 
         def build(s: Any) -> Any:
             # медиа создаётся заново на каждой попытке — свежий BytesIO
@@ -393,6 +402,7 @@ class DriveClient:
         self, file_id: str, name: str, mime: str, content: bytes
     ) -> dict[str, Any]:
         """Обновляет содержимое уже существующего файла (in-place)."""
+        name = self._clean_name(name)
 
         def build(s: Any) -> Any:
             media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime, resumable=True)
@@ -404,6 +414,7 @@ class DriveClient:
         return await self._call(build)
 
     async def rename_file(self, file_id: str, new_name: str) -> None:
+        new_name = self._clean_name(new_name)
         await self._call(
             lambda s: s.files().update(
                 fileId=file_id, body={"name": new_name}, fields="id", supportsAllDrives=True
@@ -444,3 +455,133 @@ class DriveClient:
             await self.delete_file(file_id)
         except DriveError as exc:
             log.warning("Не удалось удалить старую копию %s: %s", file_id, exc)
+
+    # ------------------------------------------- очистка имён файлов
+
+    # Автоматически удаляемые паттерны (regex) — применяются до текстовых фрагментов.
+    # Добавляй сюда новые регулярки для мусора в именах файлов.
+    AUTO_STRIP_PATTERNS: tuple[re.Pattern[str], ...] = (
+        # Telegram-бот хвосты: " tg:NCEI4SLIVOGE", " tg:ABC123XYZ" и т.д.
+        # Вырезает пробел + "tg:" + любые латинские буквы/цифры/подчёркивания/дефисы
+        re.compile(r"\s+tg:[A-Za-z0-9_-]+", re.IGNORECASE),
+    )
+
+    @classmethod
+    def clean_filename(cls, name: str, fragments: list[str]) -> str | None:
+        """Удаляет из имени файла мусорные паттерны и заданные фрагменты.
+
+        Сначала применяются AUTO_STRIP_PATTERNS (регулярки), затем точечные
+        фрагменты из списка (регистронезависимо). Возвращает новое имя, если
+        оно изменилось, или None, если чистить нечего.
+        """
+        original = name
+
+        # 1. Автоматические regex-паттерны (tg:хвосты и прочий мусор)
+        for pat in cls.AUTO_STRIP_PATTERNS:
+            name = pat.sub("", name)
+
+        # 2. Пользовательские фрагменты из конфига
+        for frag in fragments:
+            if not frag:
+                continue
+            pattern = re.compile(re.escape(frag), re.IGNORECASE)
+            name = pattern.sub("", name)
+
+        # схлопываем множественные пробелы
+        name = re.sub(r" {2,}", " ", name).strip()
+
+        # убираем пробел перед расширением: "file .pdf" -> "file.pdf"
+        name = re.sub(r"\s+\.([^.]+)$", r".\1", name)
+
+        # если после очистки имя пустое — оставляем оригинал
+        if not name or name == ".":
+            return None
+
+        return name if name != original else None
+
+    def _clean_name(self, name: str) -> str:
+        """Применяет очистку имени (regex-паттерны + фрагменты из конфига).
+
+        Используется при копировании/загрузке/переименовании. Если чистить
+        нечего — возвращается исходное имя без изменений.
+        """
+        cleaned = self.clean_filename(name, list(self._strip_fragments))
+        return cleaned if cleaned is not None else name
+
+    async def batch_clean_names(
+        self,
+        folder_id: str,
+        fragments: list[str],
+        *,
+        recursive: bool = False,
+        progress_cb: Callable[[int, int, str], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Проходит по папке и переименовывает файлы, удаляя фрагменты из имён.
+
+        Работает через серверный rename (без скачивания) — моментально.
+
+        Args:
+            folder_id: ID папки для обработки.
+            fragments: список подстрок, которые нужно удалить из имён.
+            recursive: если True, обрабатывает вложенные папки.
+            progress_cb: опциональный колбэк (processed, total, current_name).
+
+        Returns:
+            Словарь с результатами: renamed, skipped, errors.
+        """
+        items = await self.list_folder(folder_id)
+        stats = {"renamed": 0, "skipped": 0, "errors": 0, "details": []}
+
+        files_to_process = [f for f in items if f.get("mimeType") != FOLDER_MIME]
+        folders_to_process = [f for f in items if f.get("mimeType") == FOLDER_MIME]
+        total = len(files_to_process)
+
+        for idx, item in enumerate(files_to_process, 1):
+            file_id = item["id"]
+            old_name = item.get("name", "")
+            new_name = self.clean_filename(old_name, fragments)
+
+            if progress_cb:
+                try:
+                    await asyncio.to_thread(progress_cb, idx, total, old_name)
+                except Exception:
+                    pass
+
+            if new_name is None:
+                stats["skipped"] += 1
+                continue
+
+            try:
+                await self.rename_file(file_id, new_name)
+                stats["renamed"] += 1
+                stats["details"].append({"id": file_id, "old": old_name, "new": new_name})
+                log.info("Переименован: %r -> %r", old_name, new_name)
+            except DriveError as exc:
+                stats["errors"] += 1
+                stats["details"].append({"id": file_id, "old": old_name, "error": str(exc)})
+                log.warning("Ошибка переименования %r: %s", old_name, exc)
+
+        # Рекурсивно обрабатываем подпапки (их имена тоже чистим)
+        if recursive:
+            for folder in folders_to_process:
+                f_id = folder["id"]
+                f_old_name = folder.get("name", "")
+                f_new_name = self.clean_filename(f_old_name, fragments)
+                if f_new_name:
+                    try:
+                        await self.rename_file(f_id, f_new_name)
+                        stats["renamed"] += 1
+                        stats["details"].append({"id": f_id, "old": f_old_name, "new": f_new_name})
+                    except DriveError as exc:
+                        stats["errors"] += 1
+                        log.warning("Ошибка переименования папки %r: %s", f_old_name, exc)
+
+                sub_stats = await self.batch_clean_names(
+                    f_id, fragments, recursive=True, progress_cb=progress_cb
+                )
+                stats["renamed"] += sub_stats["renamed"]
+                stats["skipped"] += sub_stats["skipped"]
+                stats["errors"] += sub_stats["errors"]
+                stats["details"].extend(sub_stats["details"])
+
+        return stats
