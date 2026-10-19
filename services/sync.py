@@ -129,9 +129,15 @@ class TaskAlreadyRunningError(Exception):
 class SyncEngine:
     """Выполняет синхронизацию задач; защищён от параллельного запуска одной задачи."""
 
-    def __init__(self, db: Database, drive: DriveClient) -> None:
+    def __init__(
+        self,
+        db: Database,
+        drive: DriveClient,
+        global_exclude_patterns: tuple[str, ...] = (),
+    ) -> None:
         self._db = db
         self._drive = drive
+        self._global_excludes = global_exclude_patterns
         self._running: set[int] = set()
         self._stop_requested: set[int] = set()
         # Один проход Drive за раз: параллельные синхронизации делят один токен
@@ -726,8 +732,5 @@ def render_report(report: SyncReport) -> str:
     if not report.changes and not report.errors and not report.stale and not report.deleted \
             and not report.excluded_names:
         lines.append("✅ Изменений нет — всё актуально.")
-
-    return "\n".join(lines)
-pend("✅ Изменений нет — всё актуально.")
 
     return "\n".join(lines)
